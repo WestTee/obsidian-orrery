@@ -4,3 +4,4 @@ node_modules/
 .claude/
 data.json
 CLAUDE.md
+*.mov
