@@ -1,0 +1,68 @@
+name: Bug report
+description: Something in Orrery isn't working as expected
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report a bug. Orrery uses undocumented
+        Obsidian graph internals, so please include your versions below - that's
+        often the cause when something breaks after an update.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: What did you see, and what did you expect instead?
+      placeholder: When I open the graph, ...
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Open the graph view
+        2. Turn on ...
+        3. See ...
+    validations:
+      required: true
+  - type: input
+    id: orrery-version
+    attributes:
+      label: Orrery version
+      description: Shown at the top of the Orrery settings tab.
+      placeholder: "0.1.0"
+    validations:
+      required: true
+  - type: input
+    id: obsidian-version
+    attributes:
+      label: Obsidian version
+      description: Settings -> About -> Current version.
+      placeholder: "1.x.x"
+    validations:
+      required: true
+  - type: input
+    id: vault-size
+    attributes:
+      label: Approximate vault size
+      description: Roughly how many notes are in the graph?
+      placeholder: "~500 notes"
+  - type: textarea
+    id: console
+    attributes:
+      label: Console output (optional)
+      description: |
+        Run the "Log galaxy diagnostics" command, then open the dev console
+        (Cmd/Ctrl+Shift+I) and paste anything relevant here.
+      render: text
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checks
+      options:
+        - label: I'm on desktop (Orrery is desktop-only).
+          required: true
+        - label: I searched existing issues for a duplicate.
+          required: true

@@ -1,0 +1,25 @@
+name: Feature request
+description: Suggest an idea or improvement for Orrery
+title: "[Feature]: "
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What's the idea?
+      description: What would you like Orrery to do, and why?
+      placeholder: It would be great if ...
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered (optional)
+      description: Any workarounds or other approaches you've thought about.
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checks
+      options:
+        - label: I searched existing issues for a similar request.
+          required: true
