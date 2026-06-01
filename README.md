@@ -31,6 +31,8 @@ so there's nothing to configure to get started.
 - **Comets** - a tunable share of the Oort cloud follow elongated Keplerian
   orbits (the black hole at a focus): they drift out, then whip in close to the
   centre and back.
+- **Orbit trails** - planets and comets leave a faint, fading "comet tail" along
+  their path, so you can see the orbits at a glance. Toggle on/off in settings.
 - **Smooth, rigid spin** - the disk rotates as one, so clusters keep their
   spacing and never tangle; moons still circle their own planet.
 - **Fits your screen** - the galaxy zooms to fit on first open, whatever the size
@@ -85,6 +87,7 @@ frame.
 | Comets | **Comet reach** | How far out comets swing (aphelion) |
 | Comets | **Comet dive** | How close they dive to the black hole (perihelion) |
 | View | **Fit to view on open** | Zoom the galaxy to fit when a graph opens |
+| View | **Orbit trails** | Fading comet-tail along each planet's and comet's orbit (on/off) |
 | Advanced | **Manual group override** | Force specific folder groups + ring order |
 
 ## How it works (and the risk)

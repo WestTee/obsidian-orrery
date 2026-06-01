@@ -1,7 +1,7 @@
 {
   "id": "orrery",
   "name": "Orrery",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "minAppVersion": "1.4.0",
   "description": "Turns the graph view into a galaxy: folders become planets with orbiting moons around your most-linked note, link-free notes drift in an outer Oort cloud (some on comet orbits), and the whole disk gently spins.",
   "author": "WestTee",
