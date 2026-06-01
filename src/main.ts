@@ -334,6 +334,22 @@ export default class GraphFolderClusterPlugin extends Plugin {
 	) {
 		const nodes = renderer.nodes;
 		if (!nodes || nodes.length === 0) return;
+
+		// Bail on a degenerate viewport. On some multi-monitor / display-scaling
+		// setups Obsidian reports the graph pane as a tiny width/height (e.g. ~150
+		// or 0) on a secondary screen. Computing the layout and pinning every node
+		// into that collapsed space draws a garbage "swirl". When the viewport is
+		// too small, release our pins (so the native graph shows) and skip until
+		// it reports a real size again.
+		const rr = renderer as unknown as { width?: number; height?: number };
+		const vw = typeof rr.width === "number" ? rr.width : 1;
+		const vh = typeof rr.height === "number" ? rr.height : 1;
+		if (vw < 200 || vh < 200) {
+			this.releaseAll();
+			this.removeTrailCanvas(renderer);
+			return;
+		}
+
 		const finite = nodes.filter(
 			(n) => Number.isFinite(n.x) && Number.isFinite(n.y)
 		);
