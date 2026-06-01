@@ -503,10 +503,15 @@ export default class GraphFolderClusterPlugin extends Plugin {
 		renderer: GraphRenderer,
 		finite: GraphNode[]
 	): RendererState {
-		// Natural centre + scale: captured ONCE (or when node count changes) so
-		// tuning spread linearly resizes the ring instead of compounding.
+		// Natural centre + scale: captured ONCE per graph and never recomputed.
+		// Re-measuring is a feedback loop: a settings change unpins nodes (native
+		// physics pushes them outward), and measuring the spread from those
+		// displaced positions inflates the baseline, which enlarges the ring,
+		// which pushes them further -- the galaxy balloons on every tweak. The
+		// "Re-center" command (which clears this.scales) is the deliberate way to
+		// re-measure when the vault genuinely changes.
 		let scale = this.scales.get(renderer);
-		if (!scale || scale.nodeCount !== renderer.nodes.length) {
+		if (!scale) {
 			let cx0 = 0;
 			let cy0 = 0;
 			for (const n of finite) {
