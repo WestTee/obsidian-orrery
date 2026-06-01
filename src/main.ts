@@ -87,6 +87,10 @@ const DEFAULT_SETTINGS: ClusterSettings = {
 const OMEGA_HALO = 1.6; // Oort cloud drifts at its own rate (it's detached anyway)
 const GOLDEN_ANGLE = 2.399963229728653; // even halo scatter
 const MOTION_INTERVAL_MS = 33; // ~30fps while spinning
+// Notes in the vault root (no parent folder) cluster under this synthetic group
+// so they orbit as a normal planet instead of collapsing into the centre. "/"
+// can never collide with a real parent-folder path.
+const ROOT_GROUP = "/";
 
 /*
  * The whole disk (hub + planets + moons) rotates RIGIDLY at one rate, so every
@@ -117,7 +121,7 @@ interface GraphRenderer {
 	changed(): void;
 }
 
-type NodeKind = "anchor" | "orphan" | "hub" | "group";
+type NodeKind = "anchor" | "orphan" | "group";
 interface Classification {
 	kind: NodeKind;
 	group?: string;
@@ -354,9 +358,6 @@ export default class GraphFolderClusterPlugin extends Plugin {
 
 		const s = this.settings.strength;
 		const eps = Math.max(0.5, R * 0.002);
-		const hubDAng = speed * dt; // hubs rotate rigidly with the disk
-		const hubCos = Math.cos(hubDAng);
-		const hubSin = Math.sin(hubDAng);
 		let maxMoved = 0;
 		const updates: { node: GraphNode; x: number; y: number }[] = [];
 
@@ -384,14 +385,32 @@ export default class GraphFolderClusterPlugin extends Plugin {
 					const i = c.moonIndex ?? 1;
 					const m = c.moonCount ?? 1;
 					const arc = zone.r * slotAngle; // room at this orbit
-					const moonR = Math.min(arc * 0.42, R * 0.5) * tight;
-					const rr = moonR * (0.5 + 0.5 * Math.sqrt(i / m));
-					// Moons orbit their planet (faster than the disk turns). The
-					// planet RING itself stays rigid, so clusters never drift
-					// across each other -- only the moons circle, locally.
+					// Disc grows with sqrt(member count) so a big folder spreads
+					// into a large readable disc instead of all its moons piling
+					// up; small folders stay tight. Bounded by the room to the
+					// neighbouring planet (arc) and an absolute cap.
+					const want = R * 0.22 * Math.sqrt(m / 8);
+					const moonR = Math.min(want, arc * 0.5, R * 0.9) * tight;
+					// Orbital shells. Moons are already ordered by degree (most-
+					// linked first), so bucket them into concentric rings: ring r
+					// holds 2r+1 moons -> the high-degree notes land in the inner
+					// rings, leaf notes in the outer ones. Each ring spins at its
+					// own rate (inner faster = Keplerian), so a big cluster reads
+					// as orbital shells, not one blob. All derived from degree rank
+					// + count, and local to the cluster (no inter-cluster overlap).
+					const shell = Math.floor(Math.sqrt(i - 1));
+					const nShells = Math.floor(Math.sqrt(m - 1)) + 1;
+					const ringStart = shell * shell + 1;
+					const ringSize = Math.min(2 * shell + 1, m - ringStart + 1);
+					const jInRing = i - ringStart;
+					const rr = moonR * (0.2 + 0.8 * ((shell + 1) / nShells));
+					const ringSpeed =
+						this.settings.moonSpeed *
+						(1 + 0.6 * (1 - shell / Math.max(1, nShells - 1)));
 					const theta =
-						i * GOLDEN_ANGLE +
-						this.phase * speed * this.settings.moonSpeed;
+						shell * GOLDEN_ANGLE +
+						(jInRing / Math.max(1, ringSize)) * 2 * Math.PI +
+						this.phase * speed * ringSpeed;
 					tx = zone.x + rr * Math.cos(theta);
 					ty = zone.y + rr * Math.sin(theta);
 				}
@@ -447,15 +466,8 @@ export default class GraphFolderClusterPlugin extends Plugin {
 					ty = cy + apo * Math.sin(angle);
 				}
 			} else {
-				// hub: free in centre when still; pinned & spun when moving
-				if (!moving) {
-					if (state.pinned.has(n.id)) this.unpin(renderer, n, state);
-					continue;
-				}
-				const rx = n.x - cx;
-				const ry = n.y - cy;
-				tx = cx + (rx * hubCos - ry * hubSin);
-				ty = cy + (rx * hubSin + ry * hubCos);
+				// no other kinds exist (every note is anchor/group/orphan)
+				continue;
 			}
 
 			const nx = n.x + s * (tx - n.x);
@@ -552,13 +564,12 @@ export default class GraphFolderClusterPlugin extends Plugin {
 				orphanIds.push(n.id);
 				continue;
 			}
-			const g = gk(n.id);
-			if (g) {
-				classification.set(n.id, { kind: "group", group: g });
-				groupSet.add(g);
-			} else {
-				classification.set(n.id, { kind: "hub" });
-			}
+			// Every linked note gets a folder home; anything without one (vault
+			// root, or no override match) clusters as the ROOT_GROUP planet, so
+			// nothing is left homeless to collapse into the centre.
+			const g = gk(n.id) ?? ROOT_GROUP;
+			classification.set(n.id, { kind: "group", group: g });
+			groupSet.add(g);
 		}
 
 		orphanIds.sort();
@@ -746,7 +757,9 @@ export default class GraphFolderClusterPlugin extends Plugin {
 	/** Auto group key = the note's immediate parent folder (its directory). */
 	private autoKey(id: string): string | null {
 		const slash = id.lastIndexOf("/");
-		if (slash < 0) return null; // vault-root file -> ungrouped
+		// Vault-root notes cluster as the ROOT_GROUP planet rather than being
+		// left homeless (which used to collapse them into the black hole).
+		if (slash < 0) return ROOT_GROUP;
 		return id.slice(0, slash);
 	}
 
@@ -832,12 +845,10 @@ export default class GraphFolderClusterPlugin extends Plugin {
 			const state = this.buildState(renderer, finite);
 			const groupSizes: Record<string, number> = {};
 			let orphanCount = 0;
-			let hubCount = 0;
 			for (const c of state.classification.values()) {
 				if (c.kind === "group" && c.group)
 					groupSizes[c.group] = (groupSizes[c.group] ?? 0) + 1;
 				else if (c.kind === "orphan") orphanCount++;
-				else if (c.kind === "hub") hubCount++;
 			}
 			console.log("[orrery] DIAGNOSTICS", {
 				nodes: nodes.length,
@@ -848,7 +859,7 @@ export default class GraphFolderClusterPlugin extends Plugin {
 				anchorId: state.anchorId,
 				groupCount: Object.keys(groupSizes).length,
 				orphanCount,
-				hubCount,
+				rootGroupSize: groupSizes[ROOT_GROUP] ?? 0,
 				groupSizes,
 				sampleNodes: sample,
 			});
