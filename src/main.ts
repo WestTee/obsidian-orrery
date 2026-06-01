@@ -58,6 +58,8 @@ interface ClusterSettings {
 	cometDive: number;
 	/** Auto-fit the whole galaxy into view the first time a graph opens. */
 	fitOnLoad: boolean;
+	/** Draw fading "comet tail" trails along planet + comet orbits. */
+	showTrails: boolean;
 	/**
 	 * OPTIONAL manual override. Empty = fully automatic folder-based grouping.
 	 * If non-empty: these path prefixes define the groups AND their ring order
@@ -81,12 +83,19 @@ const DEFAULT_SETTINGS: ClusterSettings = {
 	cometReach: 2.3,
 	cometDive: 0.4,
 	fitOnLoad: true,
+	showTrails: true,
 	overrideGroups: [],
 };
 
 const OMEGA_HALO = 1.6; // Oort cloud drifts at its own rate (it's detached anyway)
 const GOLDEN_ANGLE = 2.399963229728653; // even halo scatter
 const MOTION_INTERVAL_MS = 33; // ~30fps while spinning
+// Orbit trails: each body's fading "comet tail" is an arc swept BACKWARDS along
+// its orbit from its current position. TRAIL_ARC = how far back (radians) the tail
+// reaches; TRAIL_SEGMENTS = polyline resolution. Bright at the body, fading to 0.
+const TRAIL_ARC = 2.6; // tail length in radians of orbital sweep (longer)
+const TRAIL_SEGMENTS = 40;
+const TRAIL_FALLOFF = 2.6; // opacity = (1-t)^this -> higher = sharper drop-off
 // Notes in the vault root (no parent folder) cluster under this synthetic group
 // so they orbit as a normal planet instead of collapsing into the centre. "/"
 // can never collide with a real parent-folder path.
@@ -166,6 +175,15 @@ export default class GraphFolderClusterPlugin extends Plugin {
 	private overrideMatch: string[] = [];
 	private overrideOrder: string[] = [];
 
+	/** per-renderer transparent overlay canvas for orbit trails. */
+	private trailCanvas = new WeakMap<GraphRenderer, HTMLCanvasElement>();
+	/** per-renderer comet position history (node id -> recent WORLD positions,
+	 * newest last) so comet trails follow the dot's ACTUAL eased path. */
+	private cometHistory = new WeakMap<
+		GraphRenderer,
+		Map<string, { x: number; y: number }[]>
+	>();
+
 	async onload() {
 		await this.loadSettings();
 		this.recomputeOverride();
@@ -228,6 +246,7 @@ export default class GraphFolderClusterPlugin extends Plugin {
 	onunload() {
 		this.stopLoop();
 		this.releaseAll();
+		for (const renderer of this.getRenderers()) this.removeTrailCanvas(renderer);
 	}
 
 	/* ---------------- settings ---------------- */
@@ -285,7 +304,12 @@ export default class GraphFolderClusterPlugin extends Plugin {
 	/* ---------------- main cycle ---------------- */
 
 	private maybeUpdate() {
-		if (!this.settings.enabled || this.settings.strength <= 0) return;
+		if (!this.settings.enabled || this.settings.strength <= 0) {
+			// plugin disabled -> ensure no stale trail overlays linger
+			for (const renderer of this.getRenderers())
+				this.removeTrailCanvas(renderer);
+			return;
+		}
 
 		const moving = this.settings.motion;
 		const interval = moving ? MOTION_INTERVAL_MS : this.settings.intervalMs;
@@ -356,10 +380,14 @@ export default class GraphFolderClusterPlugin extends Plugin {
 			};
 		}
 
+		// Orbit trails (fading comet-tails) are drawn on a transparent overlay,
+		// mapped through the live renderer transform so they track zoom + pan.
+		this.drawTrails(renderer, state, cx, cy, R, speed);
+
 		const s = this.settings.strength;
 		const eps = Math.max(0.5, R * 0.002);
 		let maxMoved = 0;
-		const updates: { node: GraphNode; x: number; y: number }[] = [];
+		const updates: { node: GraphNode; x: number; y: number; ease?: number }[] = [];
 
 		for (const n of finite) {
 			if (n === renderer.dragNode) continue;
@@ -368,6 +396,11 @@ export default class GraphFolderClusterPlugin extends Plugin {
 
 			let tx: number;
 			let ty: number;
+			// comets need to ease much harder than the disk: at perihelion the
+			// Kepler target whips around the black hole, and a slow lerp cuts the
+			// corner (the dot turns back before going around). A near-1 ease makes
+			// the dot actually follow the fast sweep and visibly wrap the centre.
+			let ease = s;
 
 			if (c.kind === "anchor") {
 				tx = cx; // black hole: dead centre, no rotation
@@ -422,43 +455,10 @@ export default class GraphFolderClusterPlugin extends Plugin {
 					this.settings.cometFraction > 0 &&
 					(h % 1000) / 1000 < this.settings.cometFraction;
 				if (isComet) {
-					// Real comet motion: an ellipse with the black hole at a
-					// FOCUS, timed by Kepler's 2nd law -- it drifts slowly at the
-					// far point (aphelion = "reach"), then whips fast around the
-					// black hole at its close approach (perihelion = "dive"). Both
-					// are user-tunable (x R); small per-comet variety from the hash.
-					const reach =
-						R *
-						this.settings.cometReach *
-						(0.85 + 0.3 * ((h % 97) / 97));
-					let dive =
-						R *
-						this.settings.cometDive *
-						(0.7 + 0.6 * (((h >> 3) % 97) / 97));
-					if (dive > reach * 0.9) dive = reach * 0.9; // keep an ellipse
-					const a = (reach + dive) / 2;
-					const ecc = (reach - dive) / (reach + dive);
-					const periDir = ((h * 0.6180339887) % 1) * 2 * Math.PI;
-					const M =
-						i * GOLDEN_ANGLE +
-						this.phase * speed * this.settings.cometSpeed;
-					let E = M; // solve Kepler's equation  M = E - e*sin(E)
-					for (let k = 0; k < 6; k++) {
-						E =
-							E -
-							(E - ecc * Math.sin(E) - M) /
-								(1 - ecc * Math.cos(E));
-					}
-					const nu =
-						2 *
-						Math.atan2(
-							Math.sqrt(1 + ecc) * Math.sin(E / 2),
-							Math.sqrt(1 - ecc) * Math.cos(E / 2)
-						);
-					const r = a * (1 - ecc * Math.cos(E));
-					const ang = periDir + nu;
-					tx = cx + r * Math.cos(ang);
-					ty = cy + r * Math.sin(ang);
+					const p = this.cometPos(cx, cy, R, h, i, speed, this.phase);
+					tx = p.x;
+					ty = p.y;
+					ease = 0.9; // track the fast perihelion sweep, wrap the BH
 				} else {
 					const angle =
 						i * GOLDEN_ANGLE + this.phase * speed * OMEGA_HALO;
@@ -470,8 +470,8 @@ export default class GraphFolderClusterPlugin extends Plugin {
 				continue;
 			}
 
-			const nx = n.x + s * (tx - n.x);
-			const ny = n.y + s * (ty - n.y);
+			const nx = n.x + ease * (tx - n.x);
+			const ny = n.y + ease * (ty - n.y);
 			maxMoved = Math.max(maxMoved, Math.hypot(nx - n.x, ny - n.y));
 			updates.push({ node: n, x: nx, y: ny });
 		}
@@ -923,6 +923,254 @@ export default class GraphFolderClusterPlugin extends Plugin {
 		}
 		return out;
 	}
+
+	/**
+	 * Comet world-position for hash h, orphan index i, at a given phase. Pulled out
+	 * of updateRenderer so the orbit-trail renderer evaluates the EXACT same Kepler
+	 * path (passing earlier phases traces where the comet just was).
+	 */
+	private cometPos(
+		cx: number,
+		cy: number,
+		R: number,
+		h: number,
+		i: number,
+		speed: number,
+		phase: number
+	): { x: number; y: number } {
+		const reach =
+			R * this.settings.cometReach * (0.85 + 0.3 * ((h % 97) / 97));
+		let dive =
+			R * this.settings.cometDive * (0.7 + 0.6 * (((h >> 3) % 97) / 97));
+		if (dive > reach * 0.9) dive = reach * 0.9;
+		const a = (reach + dive) / 2;
+		const ecc = (reach - dive) / (reach + dive);
+		const periDir = ((h * 0.6180339887) % 1) * 2 * Math.PI;
+		const M = i * GOLDEN_ANGLE + phase * speed * this.settings.cometSpeed;
+		let E = M;
+		for (let k = 0; k < 6; k++) {
+			E = E - (E - ecc * Math.sin(E) - M) / (1 - ecc * Math.cos(E));
+		}
+		const nu =
+			2 *
+			Math.atan2(
+				Math.sqrt(1 + ecc) * Math.sin(E / 2),
+				Math.sqrt(1 - ecc) * Math.cos(E / 2)
+			);
+		const r = a * (1 - ecc * Math.cos(E));
+		const ang = periDir + nu;
+		return { x: cx + r * Math.cos(ang), y: cy + r * Math.sin(ang) };
+	}
+
+	/* ---------------- orbit trails ---------------- */
+
+	/** The transparent overlay canvas for a renderer (created on first use). */
+	private ensureTrailCanvas(renderer: GraphRenderer): HTMLCanvasElement | null {
+		let canvas = this.trailCanvas.get(renderer);
+		if (canvas && canvas.isConnected) return canvas;
+		// host = the renderer's own canvas parent, so our overlay sits exactly
+		// over the graph and shares its box.
+		const host = (renderer as any).px?.view?.parentElement as
+			| HTMLElement
+			| undefined;
+		const fallback = (() => {
+			for (const type of ["graph", "localgraph"]) {
+				for (const leaf of this.app.workspace.getLeavesOfType(type)) {
+					if ((leaf.view as any)?.renderer === renderer)
+						return (leaf.view as any)?.containerEl as HTMLElement;
+				}
+			}
+			return undefined;
+		})();
+		const parent = host ?? fallback;
+		if (!parent) return null;
+		canvas = document.createElement("canvas");
+		canvas.addClass("orrery-trail-overlay");
+		Object.assign(canvas.style, {
+			position: "absolute",
+			inset: "0",
+			width: "100%",
+			height: "100%",
+			pointerEvents: "none",
+			zIndex: "1",
+		} as Partial<CSSStyleDeclaration>);
+		if (getComputedStyle(parent).position === "static")
+			parent.style.position = "relative";
+		parent.appendChild(canvas);
+		this.trailCanvas.set(renderer, canvas);
+		return canvas;
+	}
+
+	private removeTrailCanvas(renderer: GraphRenderer) {
+		const c = this.trailCanvas.get(renderer);
+		if (c) {
+			c.remove();
+			this.trailCanvas.delete(renderer);
+		}
+	}
+
+	/**
+	 * Draw a fading "comet tail" arc behind each planet and comet, swept backwards
+	 * along its actual orbit. World->screen uses the live renderer transform
+	 * (screen = world * scale + pan), so trails stay glued to the bodies through
+	 * zoom, pan and any setting change. Bright at the body, fading to nothing.
+	 */
+	private drawTrails(
+		renderer: GraphRenderer,
+		state: RendererState,
+		cx: number,
+		cy: number,
+		R: number,
+		speed: number
+	) {
+		if (!this.settings.showTrails) {
+			this.removeTrailCanvas(renderer);
+			return;
+		}
+		const canvas = this.ensureTrailCanvas(renderer);
+		if (!canvas) return;
+		const ctx = canvas.getContext("2d");
+		if (!ctx) return;
+
+		// live transform (all undocumented internals; guard everything)
+		const rr = renderer as any;
+		const scale: number =
+			typeof rr.scale === "number" ? rr.scale : NaN;
+		const panX: number = typeof rr.panX === "number" ? rr.panX : NaN;
+		const panY: number = typeof rr.panY === "number" ? rr.panY : NaN;
+		const W: number = typeof rr.width === "number" ? rr.width : 0;
+		const H: number = typeof rr.height === "number" ? rr.height : 0;
+		if (!isFinite(scale) || !isFinite(panX) || !isFinite(panY) || W <= 0) {
+			return; // transform not available on this build -> silently skip
+		}
+		if (canvas.width !== W || canvas.height !== H) {
+			canvas.width = W;
+			canvas.height = H;
+		}
+		ctx.setTransform(1, 0, 0, 1, 0, 0);
+		ctx.clearRect(0, 0, W, H);
+		const toS = (wx: number, wy: number): [number, number] => [
+			wx * scale + panX,
+			wy * scale + panY,
+		];
+
+		// ---- planet orbital trails: arc backwards along each planet's circle ----
+		// Anchor each arc to the planet's ACTUAL on-screen dot (it eases toward its
+		// target, so it lags the computed angle) -> trail starts exactly on the
+		// planet and trails behind it.
+		const planetNode = new Map<string, GraphNode>();
+		for (const n of renderer.nodes) {
+			const c = state.classification.get(n.id);
+			if (c && c.kind === "group" && c.planet && c.group)
+				planetNode.set(c.group, n);
+		}
+		for (const g of state.groupOrder) {
+			const geom = state.groupGeom.get(g);
+			const zr = R * (geom?.radius ?? 1); // orbital radius (world units)
+			const pn = planetNode.get(g);
+			// real angle of the planet about the centre (falls back to radius circle)
+			const angle = pn
+				? Math.atan2(pn.y - cy, pn.x - cx)
+				: 0;
+			this.strokeFadingArc(ctx, toS, cx, cy, zr, angle, scale, 1.6);
+		}
+
+		// ---- comet trails: follow the dot's ACTUAL recent path ----
+		// The node eases toward its target, so its real path is a smoothed, lagged
+		// version of the math ellipse. Modelling it never matched; instead we
+		// record where the dot has actually been and draw through that history.
+		let hist = this.cometHistory.get(renderer);
+		if (!hist) {
+			hist = new Map();
+			this.cometHistory.set(renderer, hist);
+		}
+		const liveComets = new Set<string>();
+		for (const n of renderer.nodes) {
+			const c = state.classification.get(n.id);
+			if (!c || c.kind !== "orphan") continue;
+			const h = this.hash(n.id);
+			const isComet =
+				this.settings.cometFraction > 0 &&
+				(h % 1000) / 1000 < this.settings.cometFraction;
+			if (!isComet) continue;
+			liveComets.add(n.id);
+			let pts = hist.get(n.id);
+			if (!pts) {
+				pts = [];
+				hist.set(n.id, pts);
+			}
+			// append current real position; cap history length
+			pts.push({ x: n.x, y: n.y });
+			if (pts.length > TRAIL_SEGMENTS) pts.shift();
+			this.strokeHistoryTrail(ctx, toS, pts);
+		}
+		// drop history for anything no longer a comet (e.g. settings change)
+		for (const id of [...hist.keys()]) if (!liveComets.has(id)) hist.delete(id);
+	}
+
+	/** Stroke a fading line through a body's recorded world positions (newest last). */
+	private strokeHistoryTrail(
+		ctx: CanvasRenderingContext2D,
+		toS: (x: number, y: number) => [number, number],
+		pts: { x: number; y: number }[]
+	) {
+		if (pts.length < 2) return;
+		ctx.lineCap = "round";
+		const n = pts.length;
+		for (let s = 1; s < n; s++) {
+			const a = toS(pts[s - 1].x, pts[s - 1].y);
+			const b = toS(pts[s].x, pts[s].y);
+			// newest (head) = brightest; t=0 at head, 1 at oldest tail
+			const t = 1 - s / (n - 1);
+			const alpha = Math.pow(1 - t, TRAIL_FALLOFF) * 0.32;
+			ctx.strokeStyle = `rgba(190,195,205,${alpha.toFixed(3)})`;
+			ctx.lineWidth = Math.max(0.5, 1.6 * (1 - t));
+			ctx.beginPath();
+			ctx.moveTo(a[0], a[1]);
+			ctx.lineTo(b[0], b[1]);
+			ctx.stroke();
+		}
+	}
+
+	/** Stroke a circular orbit arc that fades from the body backwards. */
+	private strokeFadingArc(
+		ctx: CanvasRenderingContext2D,
+		toS: (x: number, y: number) => [number, number],
+		cx: number,
+		cy: number,
+		radius: number,
+		headAngle: number,
+		scale: number,
+		width: number
+	) {
+		ctx.lineCap = "round";
+		for (let s = 0; s < TRAIL_SEGMENTS; s++) {
+			const t0 = s / TRAIL_SEGMENTS;
+			const t1 = (s + 1) / TRAIL_SEGMENTS;
+			// segment angles trailing BEHIND the head (head at t=0)
+			const a0 = headAngle - t0 * TRAIL_ARC;
+			const a1 = headAngle - t1 * TRAIL_ARC;
+			const [x0, y0] = toS(
+				cx + radius * Math.cos(a0),
+				cy + radius * Math.sin(a0)
+			);
+			const [x1, y1] = toS(
+				cx + radius * Math.cos(a1),
+				cy + radius * Math.sin(a1)
+			);
+			// sharper drop-off: opacity = (1-t)^TRAIL_FALLOFF. Neutral grey to
+			// match the graph's link lines, low overall opacity.
+			const alpha = Math.pow(1 - t0, TRAIL_FALLOFF) * 0.18;
+			ctx.strokeStyle = `rgba(190,195,205,${alpha.toFixed(3)})`;
+			ctx.lineWidth = Math.max(0.5, width * (0.5 + 0.5 * (1 - t0)));
+			ctx.beginPath();
+			ctx.moveTo(x0, y0);
+			ctx.lineTo(x1, y1);
+			ctx.stroke();
+		}
+	}
+
+	/** Stroke a comet's fading tail by sampling its Kepler path at past phases. */
 }
 
 /* ------------------------- settings tab ------------------------- */
@@ -1151,6 +1399,20 @@ class ClusterSettingTab extends PluginSettingTab {
 					.setValue(this.plugin.settings.fitOnLoad)
 					.onChange(async (v) => {
 						this.plugin.settings.fitOnLoad = v;
+						await this.plugin.saveSettings();
+					})
+			);
+
+		new Setting(containerEl)
+			.setName("Orbit trails")
+			.setDesc(
+				"Draw a fading comet-tail along each planet's and comet's orbital path."
+			)
+			.addToggle((t) =>
+				t
+					.setValue(this.plugin.settings.showTrails)
+					.onChange(async (v) => {
+						this.plugin.settings.showTrails = v;
 						await this.plugin.saveSettings();
 					})
 			);
