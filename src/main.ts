@@ -334,6 +334,22 @@ export default class GraphFolderClusterPlugin extends Plugin {
 	) {
 		const nodes = renderer.nodes;
 		if (!nodes || nodes.length === 0) return;
+
+		// Bail on a degenerate viewport. On some multi-monitor / display-scaling
+		// setups Obsidian reports the graph pane as a tiny width/height (e.g. ~150
+		// or 0) on a secondary screen. Computing the layout and pinning every node
+		// into that collapsed space draws a garbage "swirl". When the viewport is
+		// too small, release our pins (so the native graph shows) and skip until
+		// it reports a real size again.
+		const rr = renderer as unknown as { width?: number; height?: number };
+		const vw = typeof rr.width === "number" ? rr.width : 1;
+		const vh = typeof rr.height === "number" ? rr.height : 1;
+		if (vw < 200 || vh < 200) {
+			this.releaseAll();
+			this.removeTrailCanvas(renderer);
+			return;
+		}
+
 		const finite = nodes.filter(
 			(n) => Number.isFinite(n.x) && Number.isFinite(n.y)
 		);
@@ -964,33 +980,47 @@ export default class GraphFolderClusterPlugin extends Plugin {
 
 	/* ---------------- orbit trails ---------------- */
 
-	/** The transparent overlay canvas for a renderer (created on first use). */
+	/** The real graph <canvas> the renderer draws nodes into (robust lookup). */
+	private graphCanvasEl(renderer: GraphRenderer): HTMLCanvasElement | null {
+		const rr = renderer as any;
+		// 1) the usual handles
+		for (const cand of [rr.px?.view, rr.canvas]) {
+			if (cand instanceof HTMLCanvasElement) return cand;
+		}
+		// 2) fall back to the first <canvas> in this renderer's graph leaf
+		for (const type of ["graph", "localgraph"]) {
+			for (const leaf of this.app.workspace.getLeavesOfType(type)) {
+				if ((leaf.view as any)?.renderer === renderer) {
+					const cont = (leaf.view as any)?.containerEl as
+						| HTMLElement
+						| undefined;
+					// exclude our own overlay canvas
+					const cv = cont?.querySelector(
+						"canvas:not(.orrery-trail-overlay)"
+					);
+					if (cv instanceof HTMLCanvasElement) return cv;
+				}
+			}
+		}
+		return null;
+	}
+
+	/**
+	 * The transparent overlay canvas for a renderer (created on first use). It is
+	 * appended as a SIBLING of the graph canvas and positioned/sized each frame to
+	 * exactly match the graph canvas's own box (see syncOverlayToGraphCanvas), so
+	 * trails share the identical coordinate space as the nodes on any monitor.
+	 */
 	private ensureTrailCanvas(renderer: GraphRenderer): HTMLCanvasElement | null {
 		let canvas = this.trailCanvas.get(renderer);
 		if (canvas && canvas.isConnected) return canvas;
-		// host = the renderer's own canvas parent, so our overlay sits exactly
-		// over the graph and shares its box.
-		const host = (renderer as any).px?.view?.parentElement as
-			| HTMLElement
-			| undefined;
-		const fallback = (() => {
-			for (const type of ["graph", "localgraph"]) {
-				for (const leaf of this.app.workspace.getLeavesOfType(type)) {
-					if ((leaf.view as any)?.renderer === renderer)
-						return (leaf.view as any)?.containerEl as HTMLElement;
-				}
-			}
-			return undefined;
-		})();
-		const parent = host ?? fallback;
+		const gcv = this.graphCanvasEl(renderer);
+		const parent = gcv?.parentElement;
 		if (!parent) return null;
 		canvas = document.createElement("canvas");
 		canvas.addClass("orrery-trail-overlay");
 		Object.assign(canvas.style, {
 			position: "absolute",
-			inset: "0",
-			width: "100%",
-			height: "100%",
 			pointerEvents: "none",
 			zIndex: "1",
 		} as Partial<CSSStyleDeclaration>);
@@ -1038,17 +1068,49 @@ export default class GraphFolderClusterPlugin extends Plugin {
 			typeof rr.scale === "number" ? rr.scale : NaN;
 		const panX: number = typeof rr.panX === "number" ? rr.panX : NaN;
 		const panY: number = typeof rr.panY === "number" ? rr.panY : NaN;
-		const W: number = typeof rr.width === "number" ? rr.width : 0;
-		const H: number = typeof rr.height === "number" ? rr.height : 0;
-		if (!isFinite(scale) || !isFinite(panX) || !isFinite(panY) || W <= 0) {
+		if (!isFinite(scale) || !isFinite(panX) || !isFinite(panY)) {
 			return; // transform not available on this build -> silently skip
 		}
-		if (canvas.width !== W || canvas.height !== H) {
-			canvas.width = W;
-			canvas.height = H;
+
+		// Mirror the REAL graph canvas exactly: same on-screen box, same backing
+		// store. The renderer's pan/scale map world coords into the graph canvas's
+		// backing-pixel space, so by copying that canvas's geometry our overlay
+		// shares the identical coordinate space as the nodes -- on any monitor.
+		const gcv = this.graphCanvasEl(renderer);
+		if (!gcv) return;
+		const gRect = gcv.getBoundingClientRect();
+		if (gRect.width < 200 || gRect.height < 200) {
+			// degenerate viewport (e.g. collapsed pane on a 2nd monitor) -> skip
+			ctx.setTransform(1, 0, 0, 1, 0, 0);
+			ctx.clearRect(0, 0, canvas.width, canvas.height);
+			return;
+		}
+		// The nodes are drawn by PIXI into its renderer BUFFER, whose size can
+		// differ from the <canvas> backing store (e.g. buffer 1610x1568 while the
+		// canvas backing is 805x784 = half). renderer.panX/panY/scale map world
+		// coords into that BUFFER space. So our overlay backing must match the
+		// PIXI buffer, not the canvas backing -- otherwise everything is drawn at
+		// the wrong scale/offset (the corner "swirl"). We still stretch the CSS to
+		// fill the pane (inset:0/100%) exactly like the graph canvas does.
+		const pxr = (renderer as any).px?.renderer;
+		const bw =
+			pxr && typeof pxr.width === "number" && pxr.width > 0
+				? pxr.width
+				: gcv.width;
+		const bh =
+			pxr && typeof pxr.height === "number" && pxr.height > 0
+				? pxr.height
+				: gcv.height;
+		canvas.style.left = "0";
+		canvas.style.top = "0";
+		canvas.style.width = "100%";
+		canvas.style.height = "100%";
+		if (canvas.width !== bw || canvas.height !== bh) {
+			canvas.width = bw;
+			canvas.height = bh;
 		}
 		ctx.setTransform(1, 0, 0, 1, 0, 0);
-		ctx.clearRect(0, 0, W, H);
+		ctx.clearRect(0, 0, bw, bh);
 		const toS = (wx: number, wy: number): [number, number] => [
 			wx * scale + panX,
 			wy * scale + panY,
