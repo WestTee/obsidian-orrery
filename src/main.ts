@@ -31,9 +31,16 @@ import { App, Notice, Plugin, PluginSettingTab, Setting } from "obsidian";
  * notes are never read or modified. Disable the plugin to revert instantly.
  */
 
+type GroupBy = "folder" | "links";
+
 interface ClusterSettings {
 	enabled: boolean;
 	motion: boolean;
+	/**
+	 * What defines a planet/cluster: "folder" (default, by parent folder) or
+	 * "links" (link-communities, for vaults organised by links not folders).
+	 */
+	groupBy: GroupBy;
 	/** Ring angular velocity in rad/s (halo derived from this). */
 	rotationSpeed: number;
 	/** Moon orbital pace around its planet, as a multiplier on rotation speed. */
@@ -71,6 +78,7 @@ interface ClusterSettings {
 const DEFAULT_SETTINGS: ClusterSettings = {
 	enabled: true,
 	motion: true,
+	groupBy: "folder",
 	rotationSpeed: 0.1, // slow ambient drift
 	moonSpeed: 4.5, // moons orbit their planet faster than the disk turns
 	strength: 0.25,
@@ -100,6 +108,15 @@ const TRAIL_FALLOFF = 2.6; // opacity = (1-t)^this -> higher = sharper drop-off
 // so they orbit as a normal planet instead of collapsing into the centre. "/"
 // can never collide with a real parent-folder path.
 const ROOT_GROUP = "/";
+
+/* ---- "Group by links" mode (hub-and-spokes clustering) ---- */
+// The most-linked notes become hub "planets"; every other linked note joins the
+// hub it links to most. Deterministic, cannot fragment, no per-vault tuning. The
+// number of hubs scales with vault size (sqrt), bounded, so a small vault gets a
+// few planets and a large one gets more, without exploding.
+const LINK_HUBS_MIN = 6;
+const LINK_HUBS_MAX = 40;
+const LINK_HUBS_SQRT_DIV = 6; // hubs ~= sqrt(linkedCount) * (this-derived factor)
 
 /*
  * The whole disk (hub + planets + moons) rotates RIGIDLY at one rate, so every
@@ -569,8 +586,30 @@ export default class GraphFolderClusterPlugin extends Plugin {
 		if (best <= 0) anchorId = null;
 
 		const useOverride = this.overrideMatch.length > 0;
+		// Link mode: detect communities from the link graph (anchor + zero-link
+		// notes excluded), and use the community as each note's group. Override is
+		// folder-mode only, so it disables link mode. Falls back to folder grouping
+		// for anything LPA didn't place (shouldn't happen, but safe).
+		const linkMode = this.settings.groupBy === "links" && !useOverride;
+		let communities: Map<string, string> | null = null;
+		if (linkMode) {
+			const linkedForClustering = finite
+				.map((n) => n.id)
+				.filter(
+					(id) => id !== anchorId && (degree.get(id) ?? 0) > 0
+				);
+			communities = this.linkClusters(
+				linkedForClustering,
+				degree,
+				neighbors
+			);
+		}
 		const gk = (id: string) =>
-			useOverride ? this.overrideKey(id) : this.autoKey(id);
+			linkMode
+				? communities!.get(id) ?? this.autoKey(id)
+				: useOverride
+				? this.overrideKey(id)
+				: this.autoKey(id);
 
 		const classification = new Map<string, Classification>();
 		const orphanIds: string[] = [];
@@ -585,9 +624,9 @@ export default class GraphFolderClusterPlugin extends Plugin {
 				orphanIds.push(n.id);
 				continue;
 			}
-			// Every linked note gets a folder home; anything without one (vault
-			// root, or no override match) clusters as the ROOT_GROUP planet, so
-			// nothing is left homeless to collapse into the centre.
+			// Every linked note gets a home (community in link mode, folder
+			// otherwise); anything without one clusters as ROOT_GROUP so nothing is
+			// left homeless to collapse into the centre.
 			const g = gk(n.id) ?? ROOT_GROUP;
 			classification.set(n.id, { kind: "group", group: g });
 			groupSet.add(g);
@@ -645,11 +684,37 @@ export default class GraphFolderClusterPlugin extends Plugin {
 			if (v < minD) minD = v;
 			if (v > maxD) maxD = v;
 		}
+		// Link mode: rank planets by degree and spread them EVENLY across the
+		// radial band by rank, so distances are genuinely distributed (some near
+		// the black hole, some far) rather than all bunched on one ring. (Degrees
+		// of link clusters tend to be similar, so a degree-normalised radius
+		// clumps; rank guarantees spread.) Folder mode keeps its degree formula.
+		const rankRadius = new Map<string, number>();
+		if (linkMode) {
+			const ordered = [...groups].sort((a, b) => {
+				const da = groupDeg.get(a) ?? 0;
+				const db = groupDeg.get(b) ?? 0;
+				if (db !== da) return db - da; // most-connected first (closest in)
+				return a < b ? -1 : 1;
+			});
+			const n = Math.max(1, ordered.length - 1);
+			ordered.forEach((g, i) => {
+				// even spread across an inner band 0.45..1.7 (inside the 2.1 halo),
+				// plus a per-planet jitter so it's not a perfect spiral.
+				const t = ordered.length === 1 ? 0.5 : i / n;
+				const base = 0.45 + 1.25 * t;
+				const jit = ((this.hash(g + "#r") % 1000) / 1000 - 0.5) * 0.35;
+				rankRadius.set(g, Math.min(1.8, Math.max(0.4, base + jit)));
+			});
+		}
+
 		const groupGeom = new Map<string, { radius: number; jitter: number }>();
 		for (const g of groups) {
 			const v = groupDeg.get(g) ?? 0;
 			const norm = maxD > minD ? (v - minD) / (maxD - minD) : 0.5;
-			const radius = 1.7 - 1.0 * norm; // central clusters closer (0.7..1.7)
+			const radius = linkMode
+				? rankRadius.get(g) ?? 1
+				: 1.7 - 1.0 * norm; // folder mode: unchanged (0.7..1.7)
 			groupGeom.set(g, {
 				radius,
 				jitter: ((this.hash(g) % 1000) / 1000 - 0.5) * 2, // -1..1
@@ -704,6 +769,101 @@ export default class GraphFolderClusterPlugin extends Plugin {
 			}
 		}
 		return { degree, neighbors };
+	}
+
+	/**
+	 * Hub-and-spokes link clustering (for "group by links" mode). The most-linked
+	 * notes become hub "planets"; every other linked note joins the hub it links to
+	 * most. Deterministic (fixed id-sorted order, degree+id tie-breaks), cannot
+	 * fragment into singletons, and needs no per-vault tuning -- robust on any
+	 * vault. The result is fed into the SAME planet/moon layout as folders.
+	 *
+	 * @param ids       linked note ids to cluster (anchor + orphans excluded)
+	 * @param degree    degree per id (for ranking hubs)
+	 * @param neighbors full adjacency
+	 * @returns map of note id -> hub id (its planet/group key)
+	 */
+	private linkClusters(
+		ids: string[],
+		degree: Map<string, number>,
+		neighbors: Map<string, string[]>
+	): Map<string, string> {
+		const group = new Map<string, string>();
+		if (ids.length === 0) return group;
+
+		// choose hub count ~ sqrt(linked), bounded; deterministic ordering by
+		// degree desc then id so the same vault always picks the same hubs.
+		const byDeg = [...ids].sort((a, b) => {
+			const da = degree.get(a) ?? 0;
+			const db = degree.get(b) ?? 0;
+			if (db !== da) return db - da;
+			return a < b ? -1 : a > b ? 1 : 0;
+		});
+		const hubCount = Math.max(
+			LINK_HUBS_MIN,
+			Math.min(
+				LINK_HUBS_MAX,
+				Math.round((Math.sqrt(ids.length) * 6) / LINK_HUBS_SQRT_DIV)
+			)
+		);
+		const hubs = byDeg.slice(0, Math.min(hubCount, byDeg.length));
+		const hubSet = new Set(hubs);
+		const hubRank = new Map(hubs.map((h, i) => [h, i])); // lower = stronger
+		for (const h of hubs) group.set(h, h); // each hub is its own planet centre
+
+		// pass 1: non-hub notes join the hub they link to most (tie -> stronger hub)
+		const sorted = [...ids].sort();
+		for (const id of sorted) {
+			if (hubSet.has(id)) continue;
+			const tally = new Map<string, number>();
+			for (const n of neighbors.get(id) ?? [])
+				if (hubSet.has(n)) tally.set(n, (tally.get(n) ?? 0) + 1);
+			let best: string | null = null;
+			let bestC = -1;
+			for (const [h, c] of tally) {
+				if (
+					c > bestC ||
+					(c === bestC &&
+						best !== null &&
+						(hubRank.get(h) ?? 1e9) < (hubRank.get(best) ?? 1e9))
+				) {
+					best = h;
+					bestC = c;
+				}
+			}
+			if (best) group.set(id, best);
+		}
+
+		// pass 2: notes with no direct hub link join the hub of their most-linked
+		// already-assigned neighbour (repeat a few times to propagate outward).
+		for (let pass = 0; pass < 4; pass++) {
+			let changed = false;
+			for (const id of sorted) {
+				if (group.has(id)) continue;
+				const tally = new Map<string, number>();
+				for (const n of neighbors.get(id) ?? []) {
+					const g = group.get(n);
+					if (g) tally.set(g, (tally.get(g) ?? 0) + 1);
+				}
+				let best: string | null = null;
+				let bestC = -1;
+				for (const [g, c] of tally) {
+					if (c > bestC || (c === bestC && (best === null || g < best))) {
+						best = g;
+						bestC = c;
+					}
+				}
+				if (best) {
+					group.set(id, best);
+					changed = true;
+				}
+			}
+			if (!changed) break;
+		}
+
+		// fallback: anything still unassigned joins the strongest hub
+		for (const id of sorted) if (!group.has(id)) group.set(id, hubs[0]);
+		return group;
 	}
 
 	/** Place heavily-inter-linked groups next to each other (greedy chain). */
@@ -1126,15 +1286,34 @@ export default class GraphFolderClusterPlugin extends Plugin {
 			if (c && c.kind === "group" && c.planet && c.group)
 				planetNode.set(c.group, n);
 		}
+		// Link mode places planets far out at a tiny scale, so the subtle folder-
+		// mode arc becomes a sub-pixel sliver lost in the link lines. Use bolder,
+		// longer arcs there. Folder mode keeps its original subtle look.
+		const linkMode = this.settings.groupBy === "links";
+		const arcWidth = linkMode ? 2.6 : 1.6;
+		const arcAlpha = linkMode ? 0.4 : 0.18;
+		const arcSweep = linkMode ? TRAIL_ARC * 1.6 : TRAIL_ARC;
 		for (const g of state.groupOrder) {
 			const geom = state.groupGeom.get(g);
-			const zr = R * (geom?.radius ?? 1); // orbital radius (world units)
 			const pn = planetNode.get(g);
-			// real angle of the planet about the centre (falls back to radius circle)
-			const angle = pn
-				? Math.atan2(pn.y - cy, pn.x - cx)
-				: 0;
-			this.strokeFadingArc(ctx, toS, cx, cy, zr, angle, scale, 1.6);
+			// Use the planet's ACTUAL distance + angle so the arc sits exactly on
+			// it (falls back to the computed radius/0 if the node is missing).
+			const zr = pn
+				? Math.hypot(pn.x - cx, pn.y - cy)
+				: R * (geom?.radius ?? 1);
+			const angle = pn ? Math.atan2(pn.y - cy, pn.x - cx) : 0;
+			this.strokeFadingArc(
+				ctx,
+				toS,
+				cx,
+				cy,
+				zr,
+				angle,
+				scale,
+				arcWidth,
+				arcAlpha,
+				arcSweep
+			);
 		}
 
 		// ---- comet trails: follow the dot's ACTUAL recent path ----
@@ -1203,15 +1382,17 @@ export default class GraphFolderClusterPlugin extends Plugin {
 		radius: number,
 		headAngle: number,
 		scale: number,
-		width: number
+		width: number,
+		peakAlpha = 0.18,
+		sweep = TRAIL_ARC
 	) {
 		ctx.lineCap = "round";
 		for (let s = 0; s < TRAIL_SEGMENTS; s++) {
 			const t0 = s / TRAIL_SEGMENTS;
 			const t1 = (s + 1) / TRAIL_SEGMENTS;
 			// segment angles trailing BEHIND the head (head at t=0)
-			const a0 = headAngle - t0 * TRAIL_ARC;
-			const a1 = headAngle - t1 * TRAIL_ARC;
+			const a0 = headAngle - t0 * sweep;
+			const a1 = headAngle - t1 * sweep;
 			const [x0, y0] = toS(
 				cx + radius * Math.cos(a0),
 				cy + radius * Math.sin(a0)
@@ -1221,8 +1402,8 @@ export default class GraphFolderClusterPlugin extends Plugin {
 				cy + radius * Math.sin(a1)
 			);
 			// sharper drop-off: opacity = (1-t)^TRAIL_FALLOFF. Neutral grey to
-			// match the graph's link lines, low overall opacity.
-			const alpha = Math.pow(1 - t0, TRAIL_FALLOFF) * 0.18;
+			// match the graph's link lines.
+			const alpha = Math.pow(1 - t0, TRAIL_FALLOFF) * peakAlpha;
 			ctx.strokeStyle = `rgba(190,195,205,${alpha.toFixed(3)})`;
 			ctx.lineWidth = Math.max(0.5, width * (0.5 + 0.5 * (1 - t0)));
 			ctx.beginPath();
@@ -1287,6 +1468,22 @@ class ClusterSettingTab extends PluginSettingTab {
 					this.plugin.settings.enabled = v;
 					await this.plugin.saveSettings();
 				})
+			);
+
+		new Setting(containerEl)
+			.setName("Group by")
+			.setDesc(
+				"What defines a planet. Folder: cluster by parent folder (default). Links: cluster by link-communities - for vaults organised by links rather than folders."
+			)
+			.addDropdown((d) =>
+				d
+					.addOption("folder", "Folder (default)")
+					.addOption("links", "Links")
+					.setValue(this.plugin.settings.groupBy)
+					.onChange(async (v) => {
+						this.plugin.settings.groupBy = v as GroupBy;
+						await this.plugin.saveSettings();
+					})
 			);
 
 		new Setting(containerEl).setName("Motion").setHeading();
