@@ -1,6 +1,6 @@
 {
   "name": "obsidian-orrery",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "description": "Galaxy/orrery layout for the Obsidian graph view.",
   "main": "main.js",
   "type": "module",

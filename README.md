@@ -38,8 +38,12 @@ so there's nothing to configure to get started.
 - **Fits your screen** - the galaxy zooms to fit on first open, whatever the size
   of your vault.
 
-Grouping is derived purely from your **folder structure** - never from the graph's
-colour groups. A manual override is available for power users.
+**Folder or links - your choice.** By default, planets are your **folders**. But if
+your vault is organised by links rather than folders (one big folder, everything
+connected by `[[wikilinks]]`), switch **Group by** to **Links** and Orrery finds
+clusters from the link graph instead - so you still get planets and moons even with
+no folder structure. Either way it's derived from your vault, never the graph's
+colour groups, and a manual override is available for power users.
 
 ## Install
 
@@ -76,6 +80,7 @@ frame.
 |---|---|---|
 | | **Reset to defaults** | Restore everything to the shipped defaults |
 | | **Enable** | Master on/off |
+| | **Group by** | What defines a planet: **Folder** (default) or **Links** (cluster by the link graph - for vaults organised by links, not folders) |
 | Motion | **Galaxy motion (spin)** | Rotate the galaxy around the hub |
 | Motion | **Rotation speed** | How fast it spins |
 | Motion | **Moon orbit speed** | How fast moons circle their planet (1 = locked to the disk) |
