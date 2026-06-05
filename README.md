@@ -25,8 +25,9 @@ so there's nothing to configure to get started.
   orbits it.
 - **Planets + moons** - each folder clusters together. Its most-linked note sits
   at the centre; the rest orbit it as a disc of moons.
-- **Meaningful distances** - well-connected folders orbit closer in, peripheral
-  ones further out, so it's a real galaxy, not a uniform ring.
+- **Folder arms** - a top folder and all its subfolders sit together in one region
+  of the galaxy (a spiral "arm") instead of scattering around the ring, so your
+  folder structure reads at a glance. Attachments live in their folder's arm too.
 - **Oort cloud** - link-free notes scatter in a slow outer halo, detached.
 - **Comets** - a tunable share of the Oort cloud follow elongated Keplerian
   orbits (the black hole at a focus): they drift out, then whip in close to the

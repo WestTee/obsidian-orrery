@@ -167,6 +167,9 @@ interface RendererState {
 	groupGeom: Map<string, { radius: number; jitter: number }>;
 	/** group keys in ring-slot order */
 	groupOrder: string[];
+	/** per-group base angle (radians, before spin) -- folder "arms" sectors in
+	 * plain folder mode, golden-angle scatter in links/override mode. */
+	groupAngle: Map<string, number>;
 	/** orphan id -> stable halo index */
 	orphanIndex: Map<string, number>;
 	classification: Map<string, Classification>;
@@ -280,6 +283,10 @@ export default class GraphFolderClusterPlugin extends Plugin {
 		await this.saveData(this.settings);
 		this.recomputeOverride();
 		this.releaseAll(); // free pins (esp. hubs when motion turns off)
+		// Re-fit the camera on the next frame so layout changes (esp. group
+		// spread) stay in view. fitToView holds the galaxy centre fixed while it
+		// zooms, so this re-frames rather than losing the galaxy off-screen.
+		this.fitted = new WeakSet();
 		this.reengage();
 	}
 
@@ -401,10 +408,12 @@ export default class GraphFolderClusterPlugin extends Plugin {
 		for (let i = 0; i < order.length; i++) {
 			const geom = state.groupGeom.get(order[i]);
 			const rFactor = geom?.radius ?? 1;
-			const jitter = (geom?.jitter ?? 0) * slotAngle * 0.35;
-			// One rigid rate for the whole disk -> clusters keep their spacing
-			// and never drift across one another.
-			const angle = i * GOLDEN_ANGLE + jitter + this.phase * speed;
+			// Base angle is precomputed in buildState (folder "arms" sectors, or
+			// golden-angle scatter for links/override). One rigid rate for the
+			// whole disk -> clusters keep their spacing and never drift apart.
+			const baseAngle =
+				state.groupAngle.get(order[i]) ?? i * GOLDEN_ANGLE;
+			const angle = baseAngle + this.phase * speed;
 			const zr = R * rFactor;
 			zones[order[i]] = {
 				x: cx + zr * Math.cos(angle),
@@ -611,6 +620,14 @@ export default class GraphFolderClusterPlugin extends Plugin {
 				? this.overrideKey(id)
 				: this.autoKey(id);
 
+		// Attachments (non-markdown files: images, PDFs, ...) are real files with
+		// real folder paths, but an embed usually isn't a counted link, so they'd
+		// otherwise fall through as zero-link orphans (comets). Group them by
+		// folder like notes regardless of degree; only link-free *notes* form the
+		// Oort cloud. Tag/phantom nodes have no file extension, so they're skipped.
+		const isAttachment = (id: string) =>
+			/\.[a-z0-9]+$/i.test(id) && !id.toLowerCase().endsWith(".md");
+
 		const classification = new Map<string, Classification>();
 		const orphanIds: string[] = [];
 		const groupSet = new Set<string>();
@@ -619,7 +636,7 @@ export default class GraphFolderClusterPlugin extends Plugin {
 				classification.set(n.id, { kind: "anchor" });
 				continue;
 			}
-			if ((degree.get(n.id) ?? 0) === 0) {
+			if ((degree.get(n.id) ?? 0) === 0 && !isAttachment(n.id)) {
 				classification.set(n.id, { kind: "orphan" });
 				orphanIds.push(n.id);
 				continue;
@@ -721,6 +738,142 @@ export default class GraphFolderClusterPlugin extends Plugin {
 			});
 		}
 
+		// Folder "arms": in plain folder mode, cluster each top folder's whole
+		// subtree into one CONTIGUOUS angular sector, so subfolders sit near
+		// their parent instead of being flung apart by the golden-angle scatter.
+		// Angle-only -- radii (groupGeom) are untouched, so varied distances and
+		// the Oort cloud sitting outside everything are preserved. Links mode and
+		// manual override keep the legacy golden-angle placement unchanged.
+		const groupAngle = new Map<string, number>();
+		const folderArms = !linkMode && !useOverride;
+		if (folderArms && groupOrder.length > 0) {
+			// 1. Family level (auto-trunk): descend PAST any wrapping trunk -- a
+			//    folder that holds the majority of the vault's planets (like a
+			//    single "wiki/" root) -- and split at the first level that
+			//    actually branches. A few small sibling folders at the root
+			//    (e.g. "raw/", a stray "../" link) must NOT stop the descent, or
+			//    the whole trunk collapses into one giant arm.
+			const folderGroups = groupOrder.filter((g) => g !== ROOT_GROUP);
+			let maxDepth = 1;
+			for (const g of folderGroups)
+				maxDepth = Math.max(maxDepth, g.split("/").length);
+			let familyDepth = 1;
+			for (let d = 1; d <= maxDepth; d++) {
+				const counts = new Map<string, number>();
+				for (const g of folderGroups) {
+					const parts = g.split("/");
+					if (parts.length >= d) {
+						const pre = parts.slice(0, d).join("/");
+						counts.set(pre, (counts.get(pre) ?? 0) + 1);
+					}
+				}
+				let top = 0;
+				for (const c of counts.values()) top = Math.max(top, c);
+				// One prefix dominates (a trunk) -> keep descending into it.
+				if (counts.size <= 1 || top > folderGroups.length / 2) {
+					familyDepth = d + 1;
+					continue;
+				}
+				// First level that genuinely branches -> families live here.
+				familyDepth = d;
+				break;
+			}
+			familyDepth = Math.min(familyDepth, maxDepth);
+			const famOf = (g: string) =>
+				g === ROOT_GROUP
+					? ROOT_GROUP
+					: g.split("/").slice(0, familyDepth).join("/");
+
+			// 2. Bucket planets into families, preserving affinity order both
+			//    within a family and across families (first appearance wins).
+			const families = new Map<string, string[]>();
+			const familyOrder: string[] = [];
+			for (const g of groupOrder) {
+				const f = famOf(g);
+				let arr = families.get(f);
+				if (!arr) {
+					arr = [];
+					families.set(f, arr);
+					familyOrder.push(f);
+				}
+				arr.push(g);
+			}
+
+			// 3. Give each family a contiguous wedge sized LINEARLY by its planet
+			//    count, so every planet gets an equal angular slice (uniform
+			//    planet-density around the ring -- no sparse pockets where a small
+			//    family claims a wide wedge it can't fill). A small total gap
+			//    between arms keeps them readable (per-gap shrinks as count grows).
+			const nFam = familyOrder.length;
+			const weightOf = (f: string) => families.get(f)!.length;
+			let totalW = 0;
+			for (const f of familyOrder) totalW += weightOf(f);
+			const gapFrac = nFam <= 1 ? 0 : 0.12;
+			const usable = 2 * Math.PI * (1 - gapFrac);
+			const perGap = nFam <= 1 ? 0 : (2 * Math.PI * gapFrac) / nFam;
+
+			const rInner = 0.6;
+			const rOuter = 1.65;
+			let cursor = 0;
+			for (const f of familyOrder) {
+				const planets = families.get(f)!;
+				const wedge =
+					totalW > 0 ? usable * (weightOf(f) / totalW) : usable;
+				const k = planets.length;
+				const slot = wedge / Math.max(1, k);
+				// Angle: even spread across the wedge (affinity order) + small
+				// deterministic jitter, clamped so a planet never leaks into the
+				// neighbouring arm.
+				planets.forEach((g, j) => {
+					const t = k === 1 ? 0.5 : (j + 0.5) / k;
+					const jit =
+						((this.hash(g) % 1000) / 1000 - 0.5) * slot * 0.5;
+					const lo = cursor + slot * 0.15;
+					const hi = cursor + wedge - slot * 0.15;
+					const a = Math.min(hi, Math.max(lo, cursor + t * wedge + jit));
+					groupAngle.set(g, a);
+				});
+				// Radius: spread the same planets across a radial band by
+				// connectivity rank (the arm's hub pulls inward, leaf folders sit
+				// outward), so an arm fills 2D space toward the black hole instead
+				// of all sitting on one outer line. Radius rank and angular order
+				// are independent -> a 2D scatter, not a diagonal streak. This
+				// overrides the per-folder connectivity radius for folder mode.
+				const byDeg = [...planets].sort((a, b) => {
+					const da = groupDeg.get(a) ?? 0;
+					const db = groupDeg.get(b) ?? 0;
+					if (db !== da) return db - da;
+					return a < b ? -1 : a > b ? 1 : 0;
+				});
+				byDeg.forEach((g, rank) => {
+					const tr = k === 1 ? 0.45 : rank / (k - 1);
+					const span = (rOuter - rInner) / Math.max(2, k);
+					const rjit =
+						((this.hash(g + "#rad") % 1000) / 1000 - 0.5) *
+						span *
+						0.9;
+					const radius = Math.min(
+						1.75,
+						Math.max(0.5, rInner + (rOuter - rInner) * tr + rjit)
+					);
+					const prev = groupGeom.get(g);
+					groupGeom.set(g, {
+						radius,
+						jitter: prev?.jitter ?? 0,
+					});
+				});
+				cursor += wedge + perGap;
+			}
+		} else {
+			// Legacy golden-angle scatter (links mode / manual override):
+			// preserved exactly so those modes are unchanged.
+			const slot = (2 * Math.PI) / Math.max(1, groupOrder.length);
+			groupOrder.forEach((g, i) => {
+				const jitter = (groupGeom.get(g)?.jitter ?? 0) * slot * 0.35;
+				groupAngle.set(g, i * GOLDEN_ANGLE + jitter);
+			});
+		}
+
 		return {
 			baseline,
 			nodeCount: renderer.nodes.length,
@@ -730,6 +883,7 @@ export default class GraphFolderClusterPlugin extends Plugin {
 			orphanIndex,
 			classification,
 			groupGeom,
+			groupAngle,
 			pinned: new Set<string>(),
 		};
 	}
@@ -1031,6 +1185,18 @@ export default class GraphFolderClusterPlugin extends Plugin {
 					groupSizes[c.group] = (groupSizes[c.group] ?? 0) + 1;
 				else if (c.kind === "orphan") orphanCount++;
 			}
+			// Folder "arms": list each planet by its base angle (deg) so the
+			// angular sectors are visible -- contiguous angles = one arm; a jump
+			// in angle = an inter-arm gap. Lets you verify subfolders of the same
+			// parent land next to each other.
+			const arms = [...state.groupAngle.entries()]
+				.sort((a, b) => a[1] - b[1])
+				.map(([g, a]) => ({
+					group: g,
+					deg: Math.round(((a % (2 * Math.PI)) * 180) / Math.PI),
+					rFactor: +(state.groupGeom.get(g)?.radius ?? 0).toFixed(2),
+					size: groupSizes[g] ?? 0,
+				}));
 			console.log("[orrery] DIAGNOSTICS", {
 				nodes: nodes.length,
 				finite: finite.length,
@@ -1042,6 +1208,7 @@ export default class GraphFolderClusterPlugin extends Plugin {
 				orphanCount,
 				rootGroupSize: groupSizes[ROOT_GROUP] ?? 0,
 				groupSizes,
+				armsByAngle: arms,
 				sampleNodes: sample,
 			});
 		}
@@ -1062,6 +1229,8 @@ export default class GraphFolderClusterPlugin extends Plugin {
 				height?: number;
 				scale?: number;
 				targetScale?: number;
+				panX?: number;
+				panY?: number;
 			};
 			const w = r.width;
 			const hgt = r.height;
@@ -1079,6 +1248,19 @@ export default class GraphFolderClusterPlugin extends Plugin {
 			if (extent <= 0) return;
 			const target = (0.9 * Math.min(w, hgt)) / extent;
 			if (!isFinite(target) || target <= 0) return;
+			// Hold the galaxy CENTRE fixed on screen while we change zoom, so
+			// fitting (esp. at large spread) re-frames instead of shoving the
+			// galaxy out of view. screen = world*scale + pan, so to keep centre c
+			// put: newPan = oldPan + c*(oldScale - newScale). No-op on first load
+			// (centre ~origin); the crucial correction when scale shrinks a lot.
+			const oldScale = typeof r.scale === "number" ? r.scale : target;
+			const dScale = oldScale - target;
+			if (isFinite(dScale)) {
+				if (typeof r.panX === "number")
+					r.panX += state.center.x * dScale;
+				if (typeof r.panY === "number")
+					r.panY += state.center.y * dScale;
+			}
 			if (typeof r.targetScale === "number") r.targetScale = target;
 			if (typeof r.scale === "number") r.scale = target;
 			renderer.changed();
@@ -1551,11 +1733,11 @@ class ClusterSettingTab extends PluginSettingTab {
 		new Setting(containerEl)
 			.setName("Group spread")
 			.setDesc(
-				"Ring radius. Higher = folders further apart. The orphan halo sits beyond the ring."
+				"Ring radius. Higher = folders further apart. The orphan halo sits beyond the ring. The camera auto-zooms to keep the whole galaxy in view."
 			)
 			.addSlider((sl) =>
 				sl
-					.setLimits(0.5, 5, 0.1)
+					.setLimits(0.5, 10, 0.1)
 					.setValue(this.plugin.settings.spread)
 					.setDynamicTooltip()
 					.onChange(async (v) => {
